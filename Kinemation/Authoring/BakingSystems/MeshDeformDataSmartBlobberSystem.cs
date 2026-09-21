@@ -221,7 +221,7 @@ namespace Latios.Kinemation.Authoring.Systems
                             verticesCount = math.max(verticesCount, range.endIndex + 1);
                         }
                         builder.blendShapeBufferSize = verticesCount;
-                        var cpuBuffer                = new NativeArray<uint>(math.max(gpuBuffer.count, (int)verticesCount * 10),
+                        var cpuBuffer                = new NativeArray<uint>(math.max(gpuBuffer.count * 10, (int)verticesCount * 10),
                                                                              Allocator.Persistent,
                                                                              NativeArrayOptions.ClearMemory);
                         blendShapeRequests[index]       = UnityEngine.Rendering.AsyncGPUReadback.RequestIntoNativeArray(ref cpuBuffer, gpuBuffer);
@@ -253,6 +253,7 @@ namespace Latios.Kinemation.Authoring.Systems
                         blendShapeRequestBuffers[i] = default;
                         builder.blendShapeNames     = default;
                         builder.blendShapeRanges    = default;
+                        builder.blendShapeBufferSize = 0;
                         builders[i]                 = builder;
                     }
                     else
