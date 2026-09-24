@@ -49,6 +49,22 @@ namespace Latios.Kinemation.Systems
             EnableSystemSorting = true;
         }
     }
+
+    /// <summary>
+    /// This super system executes inside each culling pass callback, after frustum culling and before MMI range LOD
+    /// selection and draw command generation. Use it for custom culling (occlusion and the like) by clearing bits of
+    /// ChunkPerCameraCullingMask for the current culling pass; read the CullingContext on the worldBlackboardEntity
+    /// to know which view (camera or light) is being culled. Bits must only be cleared, never set.
+    /// (KREIT89 fork addition, 2026-09-23.)
+    /// </summary>
+    [DisableAutoCreation]
+    public partial class KinemationCustomCullingSuperSystem : SuperSystem
+    {
+        protected override void CreateSystems()
+        {
+            EnableSystemSorting = true;
+        }
+    }
     #endregion
 
     #region Update SuperSystems
@@ -251,6 +267,7 @@ namespace Latios.Kinemation.Systems
             GetOrCreateAndAddUnmanagedSystem<InitializeAndFilterPerCameraSystem>();
             GetOrCreateAndAddUnmanagedSystem<CullLodsSystem>();
             GetOrCreateAndAddUnmanagedSystem<FrustumCullSystem>();
+            GetOrCreateAndAddManagedSystem<KinemationCustomCullingSuperSystem>();   // KREIT89 fork: custom culling hook
             GetOrCreateAndAddUnmanagedSystem<SelectMmiRangeLodsSystem>();
             GetOrCreateAndAddUnmanagedSystem<GenerateBrgDrawCommandsSystem>();
 
