@@ -65,6 +65,22 @@ namespace Latios.Kinemation.Systems
             EnableSystemSorting = true;
         }
     }
+
+    /// <summary>
+    /// This super system executes inside each culling pass callback, after SelectMmiRangeLodsSystem has chosen this pass's
+    /// LOD (MaterialMeshInfo range and MeshLod.lodLevel) and before draw command generation. Use it to adjust the LOD
+    /// chosen for the current pass only — e.g. a coarser Mesh LOD in shadow (light) passes. Entities with a MeshLodCurve
+    /// have their level re-evaluated by the next culling pass, so a change here does not leak into other passes.
+    /// Culling bits may be cleared here, never set. (KREIT89 fork addition, 2026-09-28.)
+    /// </summary>
+    [DisableAutoCreation]
+    public partial class KinemationPostLodCullingSuperSystem : SuperSystem
+    {
+        protected override void CreateSystems()
+        {
+            EnableSystemSorting = true;
+        }
+    }
     #endregion
 
     #region Update SuperSystems
@@ -269,6 +285,7 @@ namespace Latios.Kinemation.Systems
             GetOrCreateAndAddUnmanagedSystem<FrustumCullSystem>();
             GetOrCreateAndAddManagedSystem<KinemationCustomCullingSuperSystem>();   // KREIT89 fork: custom culling hook
             GetOrCreateAndAddUnmanagedSystem<SelectMmiRangeLodsSystem>();
+            GetOrCreateAndAddManagedSystem<KinemationPostLodCullingSuperSystem>();   // KREIT89 fork: post-LOD hook (2026-09-28)
             GetOrCreateAndAddUnmanagedSystem<GenerateBrgDrawCommandsSystem>();
 
             SetRateManagerCreateAllocator(null);
