@@ -41,6 +41,13 @@ namespace Latios.Kinemation.Systems
 
         CullingComputeDispatchData<CollectState, WriteState> m_data;
 
+        // KREIT89 fork 2026-09-29 (SKIN-GROUP): skeleton entity -> skinning request group, as a flat table indexed by Entity.Index instead of a
+        // NativeHashMap. Each entry is (stamp, group); an entry counts only when its stamp matches this Collect's stamp, so the
+        // table is never cleared. At ~50k visible skinned meshes (modular villagers, ~19 meshes per skeleton) the hash lookups
+        // dominated GroupRequestsBySkeletonJob (single-threaded, ~0.45 ms). Entities with the same index cannot both be alive.
+        NativeList<int2> m_groupTable;
+        int              m_groupStamp;
+
         // Compute bindings
         int _dstTransforms;
         int _dstVertices;
@@ -68,6 +75,7 @@ namespace Latios.Kinemation.Systems
             latiosWorld = state.GetLatiosWorldUnmanaged();
 
             m_data = new CullingComputeDispatchData<CollectState, WriteState>(latiosWorld);
+            m_groupTable = new NativeList<int2>(Allocator.Persistent);   // KREIT89 fork 2026-09-29 (SKIN-GROUP)
 
             m_worldTransformHandle = new WorldTransformReadOnlyAspect.TypeHandle(ref state);
             m_worldTransformLookup = new WorldTransformReadOnlyAspect.Lookup(ref state);
@@ -107,6 +115,11 @@ namespace Latios.Kinemation.Systems
             _SkinMatrices                  = UnityEngine.Shader.PropertyToID("_SkinMatrices");
         }
 
+        public void OnDestroy(ref SystemState state)
+        {
+            if (m_groupTable.IsCreated) m_groupTable.Dispose();   // KREIT89 fork 2026-09-29 (SKIN-GROUP)
+        }
+
         [BurstCompile]
         public void OnUpdate(ref SystemState state)
         {
@@ -134,7 +147,15 @@ namespace Latios.Kinemation.Systems
             var requestsBlockList                        = new UnsafeParallelBlockList<MeshSkinningRequestWithSkeletonTarget>(256, state.WorldUpdateAllocator);
             var groupedSkinningRequestsStartsAndCounts   = new NativeList<int2>(state.WorldUpdateAllocator);
             var groupedSkinningRequests                  = new NativeList<MeshSkinningRequest>(state.WorldUpdateAllocator);
-            var skeletonEntityToSkinningRequestsGroupMap = new NativeHashMap<Entity, int>(1, state.WorldUpdateAllocator);
+            // KREIT89 fork 2026-09-29 (SKIN-GROUP): flat table instead of NativeHashMap<Entity, int>. Grows (rarely) to the entity capacity.
+            int entityCapacity = state.EntityManager.EntityCapacity;
+            if (m_groupTable.Length < entityCapacity)
+            {
+                state.Dependency.Complete();
+                m_groupTable.Resize(entityCapacity, NativeArrayOptions.ClearMemory);
+            }
+            m_groupStamp = m_groupStamp == int.MaxValue ? 1 : m_groupStamp + 1;
+            var skeletonGroupTable = m_groupTable.AsArray();
             var bufferLayouts                            = new NativeReference<BufferLayouts>(state.WorldUpdateAllocator, NativeArrayOptions.UninitializedMemory);
             var deformClassificationMap                  = latiosWorld.worldBlackboardEntity.GetCollectionComponent<DeformClassificationMap>(true);
 
@@ -172,7 +193,8 @@ namespace Latios.Kinemation.Systems
             {
                 groupedSkinningRequests                  = groupedSkinningRequests,
                 groupedSkinningRequestsStartsAndCounts   = groupedSkinningRequestsStartsAndCounts,
-                skeletonEntityToSkinningRequestsGroupMap = skeletonEntityToSkinningRequestsGroupMap,
+                skeletonGroupTable                       = skeletonGroupTable,
+                groupStamp                               = m_groupStamp,
                 requestsBlockList                        = requestsBlockList
             }.Schedule(collectJh);
 
@@ -185,7 +207,8 @@ namespace Latios.Kinemation.Systems
                 optimizedBoneBufferHandle                = SystemAPI.GetBufferTypeHandle<OptimizedBoneTransform>(true),
                 perChunkPrefixSums                       = perChunkPrefixSums,
                 renderVisibilityFeedbackFlagHandle       = SystemAPI.GetComponentTypeHandle<RenderVisibilityFeedbackFlag>(false),
-                skeletonEntityToSkinningRequestsGroupMap = skeletonEntityToSkinningRequestsGroupMap,
+                skeletonGroupTable                       = skeletonGroupTable,
+                groupStamp                               = m_groupStamp,
                 skinnedMeshesBufferHandle                = SystemAPI.GetBufferTypeHandle<DependentSkinnedMesh>(true),
                 skinningStream                           = skinningStream.AsWriter()
             }.ScheduleParallel(m_skeletonQuery, collectJh);
@@ -842,7 +865,8 @@ namespace Latios.Kinemation.Systems
 
             public NativeList<MeshSkinningRequest> groupedSkinningRequests;
             public NativeList<int2>                groupedSkinningRequestsStartsAndCounts;
-            public NativeHashMap<Entity, int>      skeletonEntityToSkinningRequestsGroupMap;
+            public NativeArray<int2>               skeletonGroupTable;   // KREIT89 fork 2026-09-29 (SKIN-GROUP)
+            public int                             groupStamp;
 
             public void Execute()
             {
@@ -850,7 +874,6 @@ namespace Latios.Kinemation.Systems
                 if (count == 0)
                     return;
                 var dstIndices                                    = new NativeArray<int>(count, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
-                skeletonEntityToSkinningRequestsGroupMap.Capacity = count;
 
                 int skeletonCount = 0;
                 {
@@ -862,17 +885,20 @@ namespace Latios.Kinemation.Systems
                         {
                             dstIndices[i] = dstIndices[i - 1];
                         }
-                        else if (skeletonEntityToSkinningRequestsGroupMap.TryGetValue(request.skeletonEntity, out var skeletonIndex))
-                        {
-                            dstIndices[i]    = skeletonIndex;
-                            previousSkeleton = request.skeletonEntity;
-                        }
                         else
                         {
-                            dstIndices[i]    = skeletonCount;
+                            var entry = skeletonGroupTable[request.skeletonEntity.Index];
+                            if (entry.x == groupStamp)
+                            {
+                                dstIndices[i] = entry.y;
+                            }
+                            else
+                            {
+                                dstIndices[i] = skeletonCount;
+                                skeletonGroupTable[request.skeletonEntity.Index] = new int2(groupStamp, skeletonCount);
+                                skeletonCount++;
+                            }
                             previousSkeleton = request.skeletonEntity;
-                            skeletonEntityToSkinningRequestsGroupMap.Add(request.skeletonEntity, skeletonCount);
-                            skeletonCount++;
                         }
                         i++;
                     }
@@ -923,7 +949,8 @@ namespace Latios.Kinemation.Systems
             [ReadOnly] public BufferTypeHandle<BoneReference>          boneReferenceBufferHandle;
             [ReadOnly] public BufferTypeHandle<OptimizedBoneTransform> optimizedBoneBufferHandle;
 
-            [ReadOnly] public NativeHashMap<Entity, int>                                  skeletonEntityToSkinningRequestsGroupMap;
+            [ReadOnly] public NativeArray<int2>                                           skeletonGroupTable;   // KREIT89 fork 2026-09-29 (SKIN-GROUP)
+            public int                                                                    groupStamp;
             [ReadOnly] public NativeArray<int2>                                           groupedSkinningRequestsStartsAndCounts;
             [NativeDisableParallelForRestriction] public NativeArray<MeshSkinningRequest> groupedSkinningRequests;  // Mostly read, but requires sorting.
 
@@ -1002,7 +1029,9 @@ namespace Latios.Kinemation.Systems
 
             bool ProcessRequests(Entity skeletonEntity, NativeArray<DependentSkinnedMesh> meshes, int indexInChunk, int skeletonBonesCount)
             {
-                if (!skeletonEntityToSkinningRequestsGroupMap.TryGetValue(skeletonEntity, out var startAndCountIndex))
+                var groupEntry = skeletonGroupTable[skeletonEntity.Index];   // KREIT89 fork 2026-09-29 (SKIN-GROUP)
+                int startAndCountIndex = groupEntry.y;
+                if (groupEntry.x != groupStamp)
                     return false;
 
                 var startAndCount                        = groupedSkinningRequestsStartsAndCounts[startAndCountIndex];
