@@ -28,6 +28,13 @@ namespace Latios.Kinemation.Systems
         float m_lodBias;
         float m_meshLodThreshold;
 
+        // KREIT89 fork (LodTimedFade): captured on the main thread in ShouldUpdateSystem, used in OnUpdate.
+        float3 m_mainCameraPosition;
+        bool   m_hasMainCamera;
+        float  m_unscaledDeltaTime;
+        int    m_frameCount;
+        int    m_lastFadeFrame;
+
         [BurstCompile]
         public void OnCreate(ref SystemState state)
         {
@@ -38,12 +45,20 @@ namespace Latios.Kinemation.Systems
                       .WithAnyEnabled<MmiRange2LodSelect, MmiRange3LodSelect, MeshLodCurve>(true).WithWorldTransformReadOnly().Build();
 
             latiosWorld.worldBlackboardEntity.AddComponentDataIfMissing(new MeshLodCrossfadeMargin { margin = (half)0.05f });
+            latiosWorld.worldBlackboardEntity.AddComponentDataIfMissing(new LodTimedFadeSettings { fadeSeconds = 0.5f, hysteresis = 0.05f });
+            m_lastFadeFrame = -1;
         }
 
         public bool ShouldUpdateSystem(ref SystemState state)
         {
             m_maximumLODLevel = UnityEngine.QualitySettings.maximumLODLevel;
             m_lodBias         = UnityEngine.QualitySettings.lodBias;
+            // LodTimedFade: which camera advances fades (the main one, not the Editor scene view), and by how much.
+            var mainCam          = UnityEngine.Camera.main;
+            m_hasMainCamera      = mainCam != null;
+            m_mainCameraPosition = m_hasMainCamera ? (float3)mainCam.transform.position : float3.zero;
+            m_unscaledDeltaTime  = UnityEngine.Time.unscaledDeltaTime;
+            m_frameCount         = UnityEngine.Time.frameCount;
 #if UNITY_6000_2_OR_NEWER
             m_meshLodThreshold = UnityEngine.QualitySettings.meshLodThreshold;
 #endif
@@ -60,6 +75,15 @@ namespace Latios.Kinemation.Systems
 
             float cameraFactorNoBias = LodUtilities.CameraFactorFrom(in parameters, 1f);
 
+            // LodTimedFade: advance only in the main camera's pass, and only once per frame. The camera is recognised by
+            // position (the Editor scene view culls too, often first). Everything else reuses the stored state.
+            bool isMainCameraPass = m_hasMainCamera && context.viewType == UnityEngine.Rendering.BatchCullingViewType.Camera &&
+                                    math.distancesq(parameters.cameraPosition, m_mainCameraPosition) < 1e-4f;
+            bool advanceFades = isMainCameraPass && m_frameCount != m_lastFadeFrame;
+            if (advanceFades)
+                m_lastFadeFrame = m_frameCount;
+            var fadeSettings = latiosWorld.worldBlackboardEntity.GetComponentData<LodTimedFadeSettings>();
+
             state.Dependency = new Job
             {
                 perCameraMaskHandle    = GetComponentTypeHandle<ChunkPerCameraCullingMask>(false),
@@ -73,6 +97,11 @@ namespace Latios.Kinemation.Systems
                 crossfadeHandle        = GetComponentTypeHandle<LodCrossfade>(false),
                 meshLodHandle          = GetComponentTypeHandle<MeshLod>(false),
                 meshLodCurveHandle     = GetComponentTypeHandle<MeshLodCurve>(true),
+                timedFadeHandle        = GetComponentTypeHandle<LodTimedFade>(false),
+                advanceFades           = advanceFades,
+                fadeStep               = fadeSettings.fadeSeconds > 0f ? m_unscaledDeltaTime / fadeSettings.fadeSeconds : 1f,
+                fadeHysteresis         = math.clamp(fadeSettings.hysteresis, 0f, 0.5f),
+                frame16                = (ushort)math.max(1, m_frameCount & 0xffff),
                 meshLodCrossfadeMargin = latiosWorld.worldBlackboardEntity.GetComponentData<MeshLodCrossfadeMargin>().margin,
                 cameraPosition         = parameters.cameraPosition,
                 isPerspective          = !parameters.isOrthographic,
@@ -99,6 +128,11 @@ namespace Latios.Kinemation.Systems
             public ComponentTypeHandle<MaterialMeshInfo>          mmiHandle;
             public ComponentTypeHandle<LodCrossfade>              crossfadeHandle;
             public ComponentTypeHandle<MeshLod>                   meshLodHandle;
+            public ComponentTypeHandle<LodTimedFade>              timedFadeHandle;
+            public bool                                           advanceFades;
+            public float                                          fadeStep;
+            public float                                          fadeHysteresis;
+            public ushort                                         frame16;
 
             public float3 cameraPosition;
             public float  cameraFactor;
@@ -127,6 +161,7 @@ namespace Latios.Kinemation.Systems
                 var meshLods                = chunk.GetComponentDataPtrRW(ref meshLodHandle);
                 var enableMeshLodCrossfades = chunk.GetEnabledMask(ref meshLodHandle);
                 var meshLodCurves           = chunk.GetComponentDataPtrRO(ref meshLodCurveHandle);
+                var timedFades              = (LodTimedFade*)chunk.GetComponentDataPtrRW(ref timedFadeHandle);
                 var enumerator              = new ChunkEntityEnumerator(true, new v128(mask.lower.Value, mask.upper.Value), chunk.Count);
                 while (enumerator.NextEntityIndex(out int i))
                 {
@@ -220,6 +255,12 @@ namespace Latios.Kinemation.Systems
                              meshLodCurve,
                              out var enableMeshLodCrossfade);
 
+                    // KREIT89 fork: LodTimedFade overrides the LOD region and crossfade chosen above.
+                    if (!cull && timedFades != null && lodGroupPercentages == null && maxLodSupported > 0 && !math.any(nullSelect.yz))
+                    {
+                        DoTimedFade(ref timedFades[i], ref mmi, ref crossfades[i], out crossfadeEnabled, select, center, height, maxLodSupported);
+                    }
+
                     if (cull)
                         mask.ClearBitAtIndex(i);
                     if (lodGroupPercentages == null || !crossfadesEnabled[i])
@@ -229,6 +270,100 @@ namespace Latios.Kinemation.Systems
                     if (select2s != null || select3s != null)
                         mmis[i] = mmi;
                 }
+            }
+
+            // KREIT89 fork (NethCoris 2026-09-30): time-based LOD crossfade. See LodTimedFade.
+            void DoTimedFade(ref LodTimedFade tf, ref MaterialMeshInfo mmi, ref LodCrossfade crossfade, out bool crossfadeEnabled,
+                             MmiRange3LodSelect select, float3 center, float height, int maxLodSupported)
+            {
+                var biasHeight = height * cameraFactor;
+                var distance   = math.select(1f, math.distance(center, cameraPosition), isPerspective);
+                var h01        = select.fullLod0ScreenHeightFraction * distance;      // LOD0 <-> LOD1 switch
+                var h12        = select.fullLod1ScreenHeightMinFraction * distance;   // LOD1 <-> LOD2 switch (3-level only)
+                int minLevel   = math.min(maxResolutionLodLevel, maxLodSupported);
+
+                if (advanceFades)
+                {
+                    // Level with the thresholds pushed out (coarsest allowed) and pulled in (finest allowed).
+                    int coarse = LevelAt(biasHeight, h01 * (1f + fadeHysteresis), h12 * (1f + fadeHysteresis), maxLodSupported);
+                    int fine   = LevelAt(biasHeight, h01 * (1f - fadeHysteresis), h12 * (1f - fadeHysteresis), maxLodSupported);
+                    coarse     = math.max(coarse, minLevel);
+                    fine       = math.max(fine, minLevel);
+
+                    ushort previous = tf.lastFrame;
+                    bool   stale    = previous == 0 || (ushort)(frame16 - previous) > 2;   // not seen recently: snap, nobody watched
+                    tf.lastFrame    = frame16;
+
+                    if (stale)
+                    {
+                        int plain     = math.max(LevelAt(biasHeight, h01, h12, maxLodSupported), minLevel);
+                        tf.currentLod = (byte)plain;
+                        tf.targetLod  = (byte)plain;
+                        tf.progress   = default;
+                    }
+                    else
+                    {
+                        int cur = tf.currentLod;
+                        // The level we want: stay unless outside the margin band.
+                        int wanted = cur < fine ? fine : (cur > coarse ? coarse : cur);
+                        float p = tf.progress;
+                        if (tf.targetLod == cur)
+                        {
+                            if (wanted != cur)
+                            {
+                                tf.targetLod = (byte)(cur + (wanted > cur ? 1 : -1));   // adjacent levels only
+                                p            = math.min(1f, fadeStep);
+                            }
+                        }
+                        else
+                        {
+                            int  dir     = tf.targetLod > cur ? 1 : -1;
+                            bool towards = (wanted - cur) * dir > 0;
+                            p            = towards ? p + fadeStep : p - fadeStep;   // reverses smoothly, never snaps back
+                        }
+                        if (p >= 1f)
+                        {
+                            tf.currentLod = tf.targetLod;
+                            p             = 0f;
+                        }
+                        else if (p <= 0f && tf.targetLod != tf.currentLod)
+                        {
+                            tf.targetLod = tf.currentLod;
+                            p            = 0f;
+                        }
+                        tf.progress = (half)p;
+                    }
+                }
+                else if (tf.lastFrame == 0)
+                {
+                    // Never advanced yet (e.g. only seen by a shadow pass so far): show the plain level, don't store it.
+                    int plain = math.max(LevelAt(biasHeight, h01, h12, maxLodSupported), minLevel);
+                    crossfadeEnabled = false;
+                    mmi.SetCurrentLodRegion(plain, false);
+                    return;
+                }
+
+                if (tf.targetLod == tf.currentLod)
+                {
+                    crossfadeEnabled = false;
+                    mmi.SetCurrentLodRegion(tf.currentLod, false);
+                }
+                else
+                {
+                    int   lo          = math.min(tf.currentLod, tf.targetLod);
+                    float progress    = math.saturate((float)tf.progress);
+                    float hiResOpacity = tf.currentLod == lo ? 1f - progress : progress;   // opacity of the finer level (lo)
+                    crossfadeEnabled  = true;
+                    mmi.SetCurrentLodRegion(lo, true);
+                    crossfade.SetFromHiResOpacity(hiResOpacity, false);
+                }
+            }
+
+            static int LevelAt(float biasHeight, float h01, float h12, int maxLodSupported)
+            {
+                if (biasHeight >= h01 || maxLodSupported < 1) return 0;
+                if (maxLodSupported < 2 || biasHeight >= h12) return 1;
+                return 2;
             }
 
             void DoEntity(ref MaterialMeshInfo mmi,

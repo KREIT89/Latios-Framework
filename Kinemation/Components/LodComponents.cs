@@ -107,6 +107,33 @@ namespace Latios.Kinemation
     public struct SpeedTreeCrossfadeTag : IComponentData { }
 
     /// <summary>
+    /// KREIT89 fork (NethCoris, 2026-09-30): TIME-BASED LOD crossfade for UseMmiRangeLodTag entities — the ECS
+    /// equivalent of LODGroup "Animate Cross-fading", which Entities Graphics does not carry over. When present
+    /// (and the entity has no LodHeightPercentagesWithCrossfadeMargins and no culled LOD level), the LOD is chosen
+    /// with a hysteresis margin around each switch point and changes by fading over LodTimedFadeSettings.fadeSeconds
+    /// of UNSCALED time, instead of switching instantly or dithering for as long as the camera stays in a band.
+    /// Fades advance only in the main camera's culling pass, once per frame; every other pass (shadows, other
+    /// cameras) draws the same state. Zero-initialised is valid ("not yet seen": the first sighting snaps).
+    /// </summary>
+    public struct LodTimedFade : IComponentData
+    {
+        public byte   currentLod;     // level fully shown when not fading
+        public byte   targetLod;      // level being faded toward; == currentLod when idle
+        public half   progress;       // 0..1 of the way from currentLod to targetLod
+        public ushort lastFrame;      // low 16 bits of the frame this entity last advanced (0 = never)
+    }
+
+    /// <summary>
+    /// KREIT89 fork: world-blackboard settings for LodTimedFade. Defaults: 0.5 s (Unity's LODGroup
+    /// crossFadeAnimationDuration default) and a 5 % margin either side of each switch point.
+    /// </summary>
+    public struct LodTimedFadeSettings : IComponentData
+    {
+        public float fadeSeconds;
+        public float hysteresis;
+    }
+
+    /// <summary>
     /// Specifies the height and screen percentages for a 2-LOD entity with the UseMmiRangeLodTag.
     /// This is the best choice for high entity counts, such as projectiles. If fullLod1ScreenHeighFraction
     /// is negative, LOD1 is treated as a culled LOD level.
