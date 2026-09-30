@@ -350,7 +350,7 @@ namespace Latios.Kinemation.Systems
                 }
                 else
                 {
-                    int   lo          = math.min(tf.currentLod, tf.targetLod);
+                    int   lo          = math.min((int)tf.currentLod, (int)tf.targetLod);   // byte args are ambiguous for math.min
                     float progress    = math.saturate((float)tf.progress);
                     float hiResOpacity = tf.currentLod == lo ? 1f - progress : progress;   // opacity of the finer level (lo)
                     crossfadeEnabled  = true;
